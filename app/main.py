@@ -60,11 +60,28 @@ def adjudicate(req: AdjudicateRequest) -> AdjudicateResponse:
             for a in req.arms]
     targets = [Target(id=t.id, x=t.x, y=t.y, priority=t.priority)
                for t in req.targets]
+    target_index = {t.id: j for j, t in enumerate(req.targets)}
+    groups = []
+    if req.dual_fibre_groups:
+        for g in req.dual_fibre_groups:
+            groups.append((target_index[g.target_a],
+                           target_index[g.target_b]))
     solver = Solver(arms, targets,
                     clearance=req.clearance,
-                    minimum_allocations=req.minimum_allocations)
+                    minimum_allocations=req.minimum_allocations,
+                    groups=groups)
     assignment, feasible, witness = solver.solve()
     r = solver.build_result(assignment, feasible, witness)
+
+    limits = {
+        "minimum_allocations_requested": r.minimum_requested,
+        "reachable_arm_target_links": r.reachable_count,
+        "arms_submitted": len(arms),
+        "targets_submitted": len(targets),
+    }
+    if groups:
+        # group-only key: omitted in ungrouped responses for compatibility
+        limits["dual_fibre_groups_submitted"] = len(groups)
 
     return AdjudicateResponse(
         status="ok" if feasible else "minimum_not_met",
@@ -92,13 +109,9 @@ def adjudicate(req: AdjudicateRequest) -> AdjudicateResponse:
                                        for p in r.pair_clearances),
             "pair_evidence": r.pair_clearances,
         },
-        limits={
-            "minimum_allocations_requested": r.minimum_requested,
-            "reachable_arm_target_links": r.reachable_count,
-            "arms_submitted": len(arms),
-            "targets_submitted": len(targets),
-        },
+        limits=limits,
         witness=r.witness,
+        dual_fibre_groups=r.groups if groups else None,
     )
 
 
@@ -117,6 +130,12 @@ def _startup_self_check() -> None:
     s = Solver(arms, targets, clearance=1, minimum_allocations=6)
     a, ok, _ = s.solve()
     assert ok and sum(1 for x in a if x >= 0) == 6
+    # The dual-fibre code path: the first two targets form one group and
+    # must still be allocated together (two distinct arms).
+    sg = Solver(arms, targets, clearance=1, minimum_allocations=6,
+                groups=[(0, 1)])
+    ag, okg, _ = sg.solve()
+    assert okg and ag[0] == 0 and ag[1] == 1 and sg.complete_groups(ag) == 1
     _ready = True
 
 

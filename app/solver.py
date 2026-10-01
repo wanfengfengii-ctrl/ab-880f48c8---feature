@@ -16,18 +16,34 @@ Hard constraints:
 * an arm connects to at most one reachable target (distance <= reach);
 * a target is used at most once;
 * the closed segment of every pair of allocations keeps at least ``clearance``
-  distance from every other allocation segment.
+  distance from every other allocation segment;
+* optional *dual-fibre groups*: ``groups`` holds disjoint pairs of target
+  indices.  The two targets of a group are indivisible: either both are
+  allocated (to two distinct arms, simultaneously) or neither is.  Targets
+  outside groups are still allocated individually.  Group atomicity is purely
+  a feasibility constraint - the four-level objective order is unchanged.
 
 Algorithm
 ---------
 The whole lexicographic objective is encoded as one *integer* edge weight
 (with dominance constants derived from the instance bounds), so a single
 maximum-weight bipartite matching (Hungarian method) solves the relaxed
-problem where pairwise collisions are ignored.  Branch-and-bound then only
-branches on collisions: if the relaxed matching contains a conflicting pair
-of allocations, every feasible solution omits at least one of the two edges,
-so we recurse with one edge forbidden at a time.  The relaxed matching value
-is an upper bound used for pruning.  All geometry stays exact (Fraction).
+problem where pairwise collisions and half-groups are ignored.
+Branch-and-bound then branches on every remaining violation:
+
+* collision: if the relaxed matching contains a conflicting pair of
+  allocations, every feasible solution omits at least one of the two edges;
+* half-group: a group has exactly one target matched; either that edge is
+  dropped, or the partner target is forced onto one of its candidate arms.
+
+The relaxed matching value is an upper bound used for pruning.  All geometry
+stays exact (Fraction).
+
+A scaled weight (factor ``group_scale``) reserves a below-stability digit that
+rewards complete groups in the relaxation only: it guides the matching away
+from half-groups, while two atom-valid solutions are still ordered exactly by
+the original objective (the bonus ``K`` is bounded by ``group_scale - 1`` and
+any real objective difference is a multiple of ``group_scale``).
 """
 
 from dataclasses import dataclass
@@ -39,6 +55,7 @@ from .geometry import segment_distance_sq
 TargetId = str
 ArmId = str
 Edge = Tuple[int, int]  # (arm index, target index)
+Group = Tuple[int, int]  # two distinct, globally disjoint target indices
 
 
 @dataclass(frozen=True)
@@ -71,6 +88,8 @@ class SolveResult:
     reachable_count: int
     minimum_requested: int
     feasible: bool
+    groups: List[dict]
+    ungrouped_maximum: Optional[int] = None
     reason: Optional[str] = None
     witness: Optional[dict] = None
 
@@ -85,6 +104,7 @@ class Solver:
         targets: Sequence[Target],
         clearance: int,
         minimum_allocations: int,
+        groups: Optional[Sequence[Group]] = None,
     ) -> None:
         self.arms = list(arms)
         self.targets = list(targets)
@@ -93,6 +113,13 @@ class Solver:
         self.n_arms = len(self.arms)
         self.n_targets = len(self.targets)
         self.clearance_sq = Fraction(clearance * clearance)
+
+        # Dual-fibre groups (validated disjoint pairs of target indices).
+        self.groups: List[Group] = [(a, b) for a, b in (groups or [])]
+        self.group_of: List[Optional[int]] = [None] * self.n_targets
+        for gi, (a, b) in enumerate(self.groups):
+            self.group_of[a] = gi
+            self.group_of[b] = gi
 
         # len2[i][j] is None when target j is unreachable for arm i.
         self.len2: List[List[Optional[int]]] = [
@@ -107,9 +134,50 @@ class Solver:
                     self.edges.append((i, j))
         self.total_reachable = len(self.edges)
 
+        # Candidate arms per grouped target (needed for half-group branching).
+        self.cand_arms: List[List[int]] = [
+            [i for i in range(self.n_arms) if self.len2[i][j] is not None]
+            for j in range(self.n_targets)
+        ]
+        # True when a group cannot even be completed without arm sharing
+        # (fewer than two reachable arms over its two targets).
+        self.group_dead: List[bool] = [
+            len(set(self.cand_arms[a]) | set(self.cand_arms[b])) < 2
+            for a, b in self.groups
+        ]
+
         self._pair_cache: Dict[Tuple[int, int, int, int],
                                Tuple[bool, Fraction, dict]] = {}
+        # Incident edges and lazily built per-edge conflict sets make
+        # "anchor edge" work a few set unions instead of repeated Python
+        # geometry loops inside branch-and-bound.
+        self.edges_by_arm: List[List[Edge]] = [[] for _ in range(self.n_arms)]
+        self.edges_by_target: List[List[Edge]] = [[] for _ in range(self.n_targets)]
+        for e in self.edges:
+            self.edges_by_arm[e[0]].append(e)
+            self.edges_by_target[e[1]].append(e)
+        self._conflict_cache: Dict[Edge, FrozenSet[Edge]] = {}
+
         self._make_weights()
+
+    def conflicts_of(self, edge: Edge) -> FrozenSet[Edge]:
+        """Edges on other arms whose closed segment is within clearance of
+        ``edge``; computed once per edge and cached."""
+        cached = self._conflict_cache.get(edge)
+        if cached is not None:
+            return cached
+        ei, ej = edge
+        hit: set = set()
+        for (k, h) in self.edges:
+            if k == ei:
+                continue
+            a, b = (ei, k) if ei < k else (k, ei)
+            t1, t2 = (ej, h) if ei < k else (h, ej)
+            if self.pair_info(a, t1, b, t2)[0]:
+                hit.add((k, h))
+        result = frozenset(hit)
+        self._conflict_cache[edge] = result
+        return result
 
     # ------------------------------------------------------------------
     # Lexicographic objective as one integer edge weight
@@ -135,18 +203,33 @@ class Solver:
         self.c3 = p_max * self.c2 + e_max * self.c1 + s_max + 1
         self._place = place
 
+        # Scale the objective by (2*n_groups + 1) to reserve a digit below
+        # the stability term.  The digit holds the count of matched grouped
+        # targets (2 per completed group, range [0, 2*n_groups]); it only
+        # guides the relaxation: since every raw objective difference is a
+        # multiple of the scale and the digit is strictly smaller than the
+        # scale, atom-valid solutions are ordered by the raw objective alone
+        # (the digit breaks raw ties toward more complete groups, never
+        # hurting an atom-valid optimum).
+        self.group_scale = 2 * len(self.groups) + 1
+
         self.weight: Dict[Edge, int] = {}
         for i, j in self.edges:
             stability_gain = (m - j) * place[i]  # vs. leaving arm i unused
-            self.weight[(i, j)] = (
+            grouped = 1 if self.group_of[j] is not None else 0
+            self.weight[(i, j)] = self.group_scale * (
                 self.c3
                 + self.c2 * self.targets[j].priority
                 - self.c1 * self.len2[i][j]
                 + stability_gain
-            )
+            ) + grouped
 
     def matching_weight(self, assignment: Sequence[int]) -> int:
         return sum(self.weight[(i, j)] for i, j in enumerate(assignment) if j >= 0)
+
+    def complete_groups(self, assignment: Sequence[int]) -> int:
+        used = {j for j in assignment if j >= 0}
+        return sum(1 for a, b in self.groups if a in used and b in used)
 
     # ------------------------------------------------------------------
     # Pairwise segment feasibility (exact arithmetic)
@@ -181,24 +264,48 @@ class Solver:
     def _first_conflict(self, used_edges: List[Edge]
                         ) -> Optional[Tuple[Edge, Edge]]:
         used_edges = sorted(used_edges)
-        for idx in range(len(used_edges)):
-            for jdx in range(idx + 1, len(used_edges)):
-                (i, j), (k, h) = used_edges[idx], used_edges[jdx]
-                if self.pair_info(i, j, k, h)[0]:
-                    return used_edges[idx], used_edges[jdx]
+        used_set = set(used_edges)
+        for e in used_edges:
+            hit = self.conflicts_of(e) & used_set
+            if hit:
+                f = min(hit)
+                return (e, f) if e < f else (f, e)
         return None
+
+    def _pick_half_group(self, used_edges: List[Edge], forbidden: FrozenSet[Edge]
+                         ) -> Optional[Tuple[int, Edge]]:
+        """Half-group with the fewest ways to place the partner target
+        without colliding with the lone matched edge (narrowest fallback)."""
+        matched_targets = {j: (i, j) for i, j in used_edges}
+        best: Optional[Tuple[int, int, Edge]] = None
+        for gi, (a, b) in enumerate(self.groups):
+            in_a = a in matched_targets
+            in_b = b in matched_targets
+            if in_a == in_b:
+                continue
+            j = a if in_a else b
+            ei, ej = matched_targets[j]
+            partner = b if j == a else a
+            options = 0
+            blocked = self.conflicts_of(matched_targets[j])
+            for k in self.cand_arms[partner]:
+                if k == ei or (k, partner) in forbidden:
+                    continue
+                if (k, partner) not in blocked:
+                    options += 1
+            cand = (options, gi, matched_targets[j])
+            if best is None or cand[:2] < best[:2]:
+                best = cand
+        return None if best is None else (best[1], best[2])
 
     def _branch_edge(self, chosen: List[Edge]) -> Edge:
         """Pick the chosen edge participating in the most internal clashes;
         ties broken by arm then target order."""
+        chosen_set = set(chosen)
         degrees = {}
-        chosen_sorted = sorted(chosen)
-        for idx in range(len(chosen_sorted)):
-            for jdx in range(idx + 1, len(chosen_sorted)):
-                (i, j), (k, h) = chosen_sorted[idx], chosen_sorted[jdx]
-                if self.pair_info(i, j, k, h)[0]:
-                    degrees[(i, j)] = degrees.get((i, j), 0) + 1
-                    degrees[(k, h)] = degrees.get((k, h), 0) + 1
+        for e in chosen:
+            for f in self.conflicts_of(e) & chosen_set:
+                degrees[e] = degrees.get(e, 0) + 1
         if not degrees:
             return chosen[0]
         return min(degrees, key=lambda e: (-degrees[e], e))
@@ -225,16 +332,43 @@ class Solver:
         return total, chosen
 
     # ------------------------------------------------------------------
-    # Branch and bound on collision pairs
+    # Branch and bound on collision pairs and half-groups
     # ------------------------------------------------------------------
     def solve(self) -> Tuple[Tuple[int, ...], bool, Optional[dict]]:
         # Feasible incumbent from deterministic greedy seeds (enables pruning
-        # at the root); then exact collision branching proves optimality.
+        # at the root); then exact branching proves optimality.  Every seed
+        # and every accepted leaf is collision-free *and* group-atomic.
         incumbent = self._greedy_seed()
         best_value = self.matching_weight(incumbent)
         best_assignment = incumbent[:]
         stats = {"nodes": 0}
         memo: Dict[FrozenSet[Edge], Tuple[int, List[Edge]]] = {}
+
+        # Groups that cannot be completed even ignoring geometry (fewer than
+        # two reachable arms over their two targets) can never contribute:
+        # forbid every edge incident to their targets up front.
+        root_forbidden: set = set()
+        for gi, (a, b) in enumerate(self.groups):
+            if self.group_dead[gi]:
+                for jj in (a, b):
+                    for i in range(self.n_arms):
+                        if self.len2[i][jj] is not None:
+                            root_forbidden.add((i, jj))
+
+        def include_anchor(forbidden: FrozenSet[Edge], edge: Edge
+                          ) -> Optional[FrozenSet[Edge]]:
+            """Restrict to solutions that use ``edge``: forbid every
+            alternative on its arm/target and every edge in the whole graph
+            that collides with it.  ``None`` if contradictory."""
+            if edge in forbidden:
+                return None
+            ei, ej = edge
+            forced = (set(forbidden)
+                      | set(self.edges_by_arm[ei])
+                      | set(self.edges_by_target[ej])
+                      | set(self.conflicts_of(edge)))
+            forced.discard(edge)
+            return frozenset(forced)
 
         def recurse(forbidden: FrozenSet[Edge]) -> None:
             nonlocal best_value, best_assignment
@@ -247,96 +381,211 @@ class Solver:
                 memo[forbidden] = (bound, chosen)
             if bound <= best_value:
                 return  # cannot improve the incumbent
-            if self._first_conflict(chosen) is None:
-                # Relaxed optimum is collision-free -> true optimum of node.
-                assignment = [-1] * self.n_arms
-                for i, j in chosen:
-                    assignment[i] = j
-                best_value = bound
-                best_assignment = assignment
+
+            # Half-groups are branched before collisions: anchoring the lone
+            # allocation removes its arm, its target and all colliding edges
+            # at once, which narrows the remaining collision search far more
+            # than branching a collision first.
+            half = self._pick_half_group(chosen, forbidden)
+            if half is not None:
+                _, edge = half
+                ei, ej = edge
+                partner = self._partner_of(ej)
+                anchored = include_anchor(forbidden, edge)
+                if anchored != forbidden:
+                    # Keeping the edge: descend; the relaxation at the
+                    # anchored node either completes the group or keeps
+                    # presenting half-groups (forbidden strictly grows, so
+                    # this always terminates).
+                    recurse(anchored)
+                    if best_value == bound:
+                        return
+                else:
+                    # The edge is already effectively anchored (no other
+                    # reachable edge on its arm/target, no clash to forbid)
+                    # yet the partner stays unmatched: enumerate the arm that
+                    # carries the partner.
+                    for k in self.cand_arms[partner]:
+                        if k == ei:
+                            continue
+                        forced = include_anchor(forbidden, (k, partner))
+                        if (forced is not None and forced != forbidden
+                                and edge not in forced):
+                            recurse(forced)
+                            if best_value == bound:
+                                return
+                # Dropping the lone edge: the group is absent in this subtree.
+                recurse(forbidden | {edge})
                 return
 
-            edge = self._branch_edge(chosen)
-            ei, ej = edge
-            # Branch 1: include ``edge`` -> forbid every other edge on its
-            # arm or target, and every edge in the whole graph that collides
-            # with it.
-            forced: set = set(forbidden)
-            for jj in range(self.n_targets):
-                if jj != ej and self.len2[ei][jj] is not None:
-                    forced.add((ei, jj))
-            for ii in range(self.n_arms):
-                if ii != ei and self.len2[ii][ej] is not None:
-                    forced.add((ii, ej))
-            for (k, h) in self.edges:
-                if k == ei:
-                    continue
-                a, b = (ei, k) if ei < k else (k, ei)
-                t1, t2 = (ej, h) if ei < k else (h, ej)
-                if self.pair_info(a, t1, b, t2)[0]:
-                    forced.add((k, h))
-            recurse(frozenset(forced))
-            if best_value == bound:
-                return  # reached the node's upper bound
-            # Branch 2: exclude ``edge``.
-            recurse(forbidden | {edge})
+            # Collision violations: binary include/exclude on the edge that
+            # participates in the most clashes.
+            if self._first_conflict(chosen) is not None:
+                edge = self._branch_edge(chosen)
+                forced = include_anchor(forbidden, edge)
+                if forced is not None:
+                    recurse(forced)
+                    if best_value == bound:
+                        return
+                recurse(forbidden | {edge})
+                return
 
-        recurse(frozenset())
+            # Relaxed optimum is collision-free and group-atomic -> true
+            # optimum of this node.
+            assignment = [-1] * self.n_arms
+            for i, j in chosen:
+                assignment[i] = j
+            best_value = bound
+            best_assignment = assignment
+
+        recurse(frozenset(root_forbidden))
         self.solve_stats = stats
 
         best_tuple = tuple(best_assignment)
         count = sum(1 for x in best_tuple if x >= 0)
         witness = None
         if count < self.minimum_allocations:
-            witness = self._shortfall_witness()
+            witness = self._shortfall_witness(best_tuple)
         return best_tuple, count >= self.minimum_allocations, witness
 
+    def _partner_of(self, target: int) -> int:
+        """The other target index in the group containing ``target``."""
+        gi = self.group_of[target]
+        a, b = self.groups[gi]
+        return b if target == a else a
+
     # ------------------------------------------------------------------
-    # Greedy feasible seeds
+    # Greedy feasible seeds (always collision-free and group-atomic)
     # ------------------------------------------------------------------
+    def _edge_ok(self, i: int, j: int, placed: List[Edge]) -> bool:
+        for k, h in placed:
+            a, b = (i, k) if i < k else (k, i)
+            t1, t2 = (j, h) if i < k else (h, j)
+            if self.pair_info(a, t1, b, t2)[0]:
+                return False
+        return True
+
     def _greedy_seed(self) -> List[int]:
-        """Best of several deterministic greedy, always-feasible passes."""
+        """Best of several deterministic greedy, always-feasible passes.
+
+        Every returned assignment respects group atomicity: grouped targets
+        only ever appear as a complete pair placed in one move; targets of a
+        group that could not be placed are left unused.
+        """
         n, m = self.n_arms, self.n_targets
         candidates: List[List[int]] = []
 
-        def greedy(arm_order, target_key):
+        def best_placement(gi, assignment, placed):
+            """Highest-gain feasible placement of group ``gi`` given the
+            current partial assignment: ``((i, j_a_or_b), (k, other))``."""
+            a, b = self.groups[gi]
+            best = None
+            for ja, jb in ((a, b), (b, a)):
+                for i in self.cand_arms[ja]:
+                    if assignment[i] >= 0 or not self._edge_ok(i, ja, placed):
+                        continue
+                    for k in self.cand_arms[jb]:
+                        if k == i or assignment[k] >= 0:
+                            continue
+                        if not self._edge_ok(k, jb, placed + [(i, ja)]):
+                            continue
+                        gain = self.weight[(i, ja)] + self.weight[(k, jb)]
+                        # canonical orientation tie-break: a on smaller arm
+                        orient = 0 if ja == a else 1
+                        key = (-gain, min(i, k), max(i, k), orient)
+                        if best is None or key < best[0]:
+                            best = (key, (i, ja, k, jb))
+            return None if best is None else best[1]
+
+        def seed_phased(group_order, arm_order, target_key):
+            """Place whole groups first (in ``group_order``), then greedily
+            assign ungrouped targets to the remaining arms."""
             assignment = [-1] * n
             used = [False] * m
             placed: List[Edge] = []
+            for gi in group_order:
+                if self.group_dead[gi]:
+                    continue
+                a, b = self.groups[gi]
+                if used[a] or used[b]:
+                    continue
+                mv = best_placement(gi, assignment, placed)
+                if mv is not None:
+                    i, ja, k, jb = mv
+                    assignment[i], assignment[k] = ja, jb
+                    used[ja] = used[jb] = True
+                    placed += [(i, ja), (k, jb)]
             for i in arm_order:
+                if assignment[i] >= 0:
+                    continue
                 for j in sorted((j for j in range(m)
-                                 if self.len2[i][j] is not None and not used[j]),
+                                 if self.group_of[j] is None
+                                 and self.len2[i][j] is not None and not used[j]),
                                 key=lambda j, i=i: target_key(i, j)):
-                    clash = False
-                    for k, h in placed:
-                        a, b = (i, k) if i < k else (k, i)
-                        t1, t2 = (j, h) if i < k else (h, j)
-                        if self.pair_info(a, t1, b, t2)[0]:
-                            clash = True
-                            break
-                    if not clash:
+                    if self._edge_ok(i, j, placed):
                         assignment[i] = j
                         used[j] = True
                         placed.append((i, j))
                         break
             return assignment
 
-        candidates.append(greedy(range(n), lambda i, j: j))
-        # Process the most constrained arms first.
+        def seed_best_move(prefer_groups: bool):
+            """Repeatedly take the highest-gain feasible move, choosing
+            between single (ungrouped) allocations and whole-group moves."""
+            assignment = [-1] * n
+            used = [False] * m
+            placed: List[Edge] = []
+            while True:
+                moves = []
+                for i in range(n):
+                    if assignment[i] >= 0:
+                        continue
+                    for j in range(m):
+                        if used[j] or self.group_of[j] is not None:
+                            continue
+                        if self.len2[i][j] is not None and \
+                                self._edge_ok(i, j, placed):
+                            moves.append((self.weight[(i, j)], 0,
+                                          (i, j, -1, -1)))
+                for gi, (a, b) in enumerate(self.groups):
+                    if used[a] or used[b] or self.group_dead[gi]:
+                        continue
+                    mv = best_placement(gi, assignment, placed)
+                    if mv is not None:
+                        i, ja, k, jb = mv
+                        gain = self.weight[(i, ja)] + self.weight[(k, jb)]
+                        moves.append((gain, 1 if prefer_groups else -1, mv))
+                if not moves:
+                    break
+                _, _, mv = max(moves, key=lambda t: (t[0], t[1]))
+                i, ja, k, jb = mv
+                assignment[i] = ja
+                used[ja] = True
+                placed.append((i, ja))
+                if k >= 0:
+                    assignment[k] = jb
+                    used[jb] = True
+                    placed.append((k, jb))
+            return assignment
+
         constrained = sorted(
             range(n),
             key=lambda i: (sum(1 for d2 in self.len2[i] if d2 is not None), i))
-        candidates.append(greedy(constrained,
-                                 lambda i, j: -self.targets[j].priority))
-        candidates.append(greedy(constrained, lambda i, j: self.len2[i][j]))
+        group_idx = list(range(len(self.groups)))
+        candidates.append(seed_phased(group_idx, range(n), lambda i, j: j))
+        candidates.append(seed_phased(list(reversed(group_idx)), constrained,
+                                      lambda i, j: -self.targets[j].priority))
+        candidates.append(seed_best_move(prefer_groups=True))
+        candidates.append(seed_best_move(prefer_groups=False))
         return max(candidates, key=self.matching_weight)
 
     # ------------------------------------------------------------------
     # Shortfall explanation
     # ------------------------------------------------------------------
-    def _shortfall_witness(self) -> dict:
+    def _shortfall_witness(self, assignment: Sequence[int]) -> dict:
         """Structural evidence when the minimum cannot be met: the tightest
-        violating pair among individually reachable allocations (if any)."""
+        violating pair among individually reachable allocations (if any),
+        plus an explicit dual-fibre-group attribution."""
         blocking = None
         best_dist: Optional[Fraction] = None
         for i in range(self.n_arms):
@@ -360,11 +609,32 @@ class Solver:
                                 "required_clearance": self.clearance,
                                 "witness": w,
                             }
-        return {
+        witness = {
             "blocking_pair": blocking,
             "capacity_limit": min(self.n_arms, self.n_targets),
             "reachable_arm_target_links": self.total_reachable,
         }
+        if self.groups:
+            grouped_max = sum(1 for x in assignment if x >= 0)
+            ref_solver = Solver(self.arms, self.targets, self.clearance,
+                                max(self.minimum_allocations, 1))
+            ref_assignment, _, _ = ref_solver.solve()
+            ungrouped_max = sum(1 for x in ref_assignment if x >= 0)
+            witness["ungrouped_max_allocations"] = ungrouped_max
+            witness["dual_fibre_shortfall"] = {
+                "groups_submitted": len(self.groups),
+                "groups_allocated": self.complete_groups(assignment),
+                "groups_unallocated": (len(self.groups)
+                                       - self.complete_groups(assignment)),
+                "grouped_max_allocations": grouped_max,
+                "ungrouped_max_allocations": ungrouped_max,
+                "allocations_lost_to_atomicity": max(
+                    0, ungrouped_max - grouped_max),
+                "minimum_blocked_by_atomicity": (
+                    ungrouped_max >= self.minimum_allocations
+                    and grouped_max < self.minimum_allocations),
+            }
+        return witness
 
     # ------------------------------------------------------------------
     # Result assembly with evidence
@@ -426,7 +696,37 @@ class Solver:
                               for j in range(self.n_targets)
                               if j not in used_targets]
 
+        # Per-group atomic allocation status (complete pairs or the group as
+        # a whole being unallocated - a half-group never appears).
+        group_status: List[dict] = []
+        arm_for_target = {j: i for i, j in placed}
+        for gi, (a, b) in enumerate(self.groups):
+            if a in arm_for_target and b in arm_for_target:
+                ia, ib = arm_for_target[a], arm_for_target[b]
+                group_status.append({
+                    "group_index": gi,
+                    "targets": [self.targets[a].id, self.targets[b].id],
+                    "allocated": True,
+                    "allocations": [
+                        {"arm_id": self.arms[ia].id,
+                         "target_id": self.targets[a].id},
+                        {"arm_id": self.arms[ib].id,
+                         "target_id": self.targets[b].id},
+                    ],
+                })
+            else:
+                group_status.append({
+                    "group_index": gi,
+                    "targets": [self.targets[a].id, self.targets[b].id],
+                    "allocated": False,
+                    "allocations": [],
+                    "reason": ("structurally uncompletable"
+                               if self.group_dead[gi]
+                               else "not part of the joint optimum"),
+                })
+
         count = len(pairs)
+        ungrouped_maximum: Optional[int] = None
         if not feasible:
             if min(self.n_arms, self.n_targets) < self.minimum_allocations:
                 cause = "fewer arms/targets than the requested minimum"
@@ -440,6 +740,22 @@ class Solver:
                 f"maximum non-colliding reachable allocation has {count} "
                 f"pair(s); {cause}"
             )
+            if witness is not None and "dual_fibre_shortfall" in witness:
+                d = witness["dual_fibre_shortfall"]
+                ungrouped_maximum = d["ungrouped_max_allocations"]
+                reason += (
+                    f"; dual-fibre atomicity: {d['groups_allocated']} of "
+                    f"{d['groups_submitted']} group(s) fully allocated, "
+                    f"{d['groups_unallocated']} group(s) dropped as a whole, "
+                    f"joint optimum {d['grouped_max_allocations']} vs "
+                    f"{d['ungrouped_max_allocations']} without groups "
+                    f"({d['allocations_lost_to_atomicity']} allocation(s) "
+                    f"lost to the all-or-nothing group constraint)"
+                )
+                if d["minimum_blocked_by_atomicity"]:
+                    reason += ("; the requested minimum WOULD be reachable "
+                               "without the dual-fibre atomic constraint, so "
+                               "the shortfall is caused by group atomicity")
         else:
             reason = None
 
@@ -457,6 +773,8 @@ class Solver:
             reachable_count=self.total_reachable,
             minimum_requested=self.minimum_allocations,
             feasible=feasible,
+            groups=group_status,
+            ungrouped_maximum=ungrouped_maximum,
             reason=reason,
             witness=witness,
         )

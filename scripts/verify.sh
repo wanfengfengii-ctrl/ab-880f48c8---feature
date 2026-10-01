@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # One-shot verification run inside the "verify" Compose service.
-# Aggregates: unit tests, application build/import check and a collision-aware
-# API smoke test.  Exits non-zero if any stage fails.
+# Aggregates: unit tests, application build/import check and a collision- and
+# dual-fibre-group-aware API smoke test.  Exits non-zero if any stage fails.
 set -u
 
 cd "$(dirname "$0")/.."
@@ -19,7 +19,7 @@ echo "== [2/3] application build / import check =="
 build_rc=$?
 [ "$build_rc" -eq 0 ] || { echo "build check failed ($build_rc)"; status=1; }
 
-echo "== [3/3] API smoke (collision constraints) =="
+echo "== [3/3] API smoke (collision + dual-fibre groups) =="
 "$PYTHON" scripts/smoke_api.py
 smoke_rc=$?
 [ "$smoke_rc" -eq 0 ] || { echo "API smoke failed ($smoke_rc)"; status=1; }
