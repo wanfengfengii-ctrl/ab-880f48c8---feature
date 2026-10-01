@@ -29,11 +29,21 @@ class TargetIn(StrictModel):
     priority: int = Field(..., ge=1)
 
 
+class FibreGroupIn(StrictModel):
+    id: str = Field(..., min_length=1)
+    target_a: str = Field(..., min_length=1)
+    target_b: str = Field(..., min_length=1)
+
+
 class AdjudicateRequest(StrictModel):
     arms: List[ArmIn] = Field(..., min_length=6, max_length=12)
     targets: List[TargetIn] = Field(..., min_length=6, max_length=16)
     clearance: int = Field(..., ge=1)
     minimum_allocations: int = Field(..., ge=1)
+    # Optional dual-fibre observation groups (1..6).  Each group references
+    # two distinct targets; a target may belong to at most one group.
+    fibre_groups: Optional[List[FibreGroupIn]] = Field(
+        default=None, min_length=1, max_length=6)
 
     @model_validator(mode="after")
     def _unique_ids(self) -> "AdjudicateRequest":
@@ -45,6 +55,29 @@ class AdjudicateRequest(StrictModel):
         if len(set(target_ids)) != len(target_ids):
             dup = sorted({x for x in target_ids if target_ids.count(x) > 1})
             raise ValueError(f"duplicate target ids: {dup}")
+        if self.fibre_groups is not None:
+            group_ids = [g.id for g in self.fibre_groups]
+            if len(set(group_ids)) != len(group_ids):
+                dup = sorted({x for x in group_ids
+                              if group_ids.count(x) > 1})
+                raise ValueError(f"duplicate fibre group ids: {dup}")
+            target_set = set(target_ids)
+            seen: List[str] = []
+            for g in self.fibre_groups:
+                if g.target_a == g.target_b:
+                    raise ValueError(
+                        f"fibre group {g.id!r} must reference two distinct "
+                        "targets")
+                for t in (g.target_a, g.target_b):
+                    if t not in target_set:
+                        raise ValueError(
+                            f"fibre group {g.id!r} references unknown target "
+                            f"{t!r}")
+                    if t in seen:
+                        raise ValueError(
+                            f"target {t!r} is reused by more than one fibre "
+                            "group; targets must not be shared across groups")
+                    seen.append(t)
         return self
 
 
@@ -83,6 +116,40 @@ class ShortfallWitness(BaseModel):
     blocking_pair: Optional[WitnessPair] = None
     capacity_limit: int
     reachable_arm_target_links: int
+    dual_fibre: Optional["DualFibreWitness"] = None
+
+
+class FibreGroupMemberOut(BaseModel):
+    group_id: str
+    slot: str  # "a" | "b"
+    target_id: str
+    allocated: bool
+    arm_id: Optional[str] = None
+    extension: Optional[float] = None
+    extension_sq: Optional[int] = None
+
+
+class FibreGroupOut(BaseModel):
+    group_id: str
+    status: str  # "allocated" | "unallocated"
+    members: List[FibreGroupMemberOut]
+
+
+class DualFibreSplitGroup(BaseModel):
+    group_id: str
+    allocated_target: str
+    allocated_arm: str
+    unallocated_target: str
+
+
+class DualFibreWitness(BaseModel):
+    constraint: str
+    groups_submitted: int
+    maximum_without_atomicity: int
+    maximum_with_atomicity: int
+    allocations_blocked_by_atomicity: int
+    would_be_split_groups: List[DualFibreSplitGroup]
+    note: str
 
 
 class AdjudicateResponse(BaseModel):
@@ -97,3 +164,4 @@ class AdjudicateResponse(BaseModel):
     clearance: dict
     limits: dict
     witness: Optional[ShortfallWitness] = None
+    fibre_groups: Optional[List[FibreGroupOut]] = None

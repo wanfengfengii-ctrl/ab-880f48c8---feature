@@ -3,14 +3,14 @@ import itertools
 import random
 import time
 
-from app.solver import Arm, Solver, Target
+from app.solver import Arm, FibreGroup, Solver, Target
 
 
 def stability_tuple(combo, n_targets):
     return tuple(j if j >= 0 else n_targets for j in combo)
 
 
-def brute(s, n_arms, n_targets, targets):
+def brute(s, n_arms, n_targets, targets, group_pairs=()):
     best = None
     for combo in itertools.product(range(-1, n_targets), repeat=n_arms):
         used = set()
@@ -38,6 +38,15 @@ def brute(s, n_arms, n_targets, targets):
             prio += targets[j].priority
         if not ok:
             continue
+        # Dual-fibre atomicity: each paired pair is both matched or neither.
+        for ja, jb in group_pairs:
+            arm_a = next((ii for ii, jj in enumerate(combo) if jj == ja), None)
+            arm_b = next((ii for ii, jj in enumerate(combo) if jj == jb), None)
+            if (arm_a is None) != (arm_b is None):
+                ok = False
+                break
+        if not ok:
+            continue
         key = (len(placed), prio, -ext, tuple(-x for x in stability_tuple(combo, n_targets)))
         if best is None or key > best[0]:
             best = (key, combo)
@@ -54,6 +63,24 @@ def random_instance(rng, n_arms=None, n_targets=None):
                       rng.randint(1, 9)) for j in range(n_targets)]
     clearance = rng.randint(1, 4)
     return arms, targets, clearance
+
+
+def grouped_instance(rng):
+    n_arms = rng.randint(2, 5)
+    n_targets = rng.randint(2, 7)
+    cr = rng.choice([3, 6, 12])
+    arms = [Arm(f"a{i}", rng.randint(-cr, cr), rng.randint(-cr, cr),
+                rng.randint(2, 8)) for i in range(n_arms)]
+    targets = [Target(f"t{j}", rng.randint(-cr, cr), rng.randint(-cr, cr),
+                      rng.randint(1, 9)) for j in range(n_targets)]
+    clearance = rng.randint(1, 4)
+    idxs = list(range(n_targets))
+    rng.shuffle(idxs)
+    k = rng.randint(0, min(3, n_targets // 2))
+    pairs = [tuple(sorted(idxs[2 * g:2 * g + 2])) for g in range(k)]
+    groups = [FibreGroup(f"g{g}", f"t{ja}", f"t{jb}")
+              for g, (ja, jb) in enumerate(pairs)]
+    return arms, targets, clearance, pairs, groups
 
 
 def main():
@@ -77,6 +104,21 @@ def main():
                 print(" targets:", targets, "clearance", clearance)
     print(f"fuzz: 300 trials, fails={fails}, slow={slow}")
 
+    # Differential fuzz with dual-fibre groups: atomic pairs enforced by the
+    # solver must agree with the brute-force optimum over atomic pairs.
+    rng = random.Random(7)
+    gfails = 0
+    for trial in range(300):
+        arms, targets, clearance, pairs, groups = grouped_instance(rng)
+        s = Solver(arms, targets, clearance, 1, groups=groups)
+        a, _, _ = s.solve()
+        b = brute(s, len(arms), len(targets), targets, pairs)
+        if tuple(a) != tuple(b):
+            gfails += 1
+            print("GROUP MISMATCH", trial, "got", a, "want", b,
+                  "groups", pairs)
+    print(f"group fuzz: 300 trials, fails={gfails}")
+
     random.seed(1)
     arms = [Arm(f"a{i}", random.randint(0, 40), random.randint(0, 40),
                 random.randint(15, 40)) for i in range(12)]
@@ -96,6 +138,15 @@ def main():
     a, _, _ = s.solve()
     print(f"grid: n={sum(x >= 0 for x in a)} nodes={s.solve_stats['nodes']} "
           f"time={time.time()-t0:.3f}s")
+
+    # Maximum-size instance with all six dual-fibre groups.
+    groups = [FibreGroup(f"g{g}", f"t{2*g}", f"t{2*g+1}") for g in range(6)]
+    for cl in (1, 3, 6, 10):
+        s = Solver(arms, targets, cl, 1, groups=groups)
+        t0 = time.time()
+        a, _, _ = s.solve()
+        print(f"grouped dense cl={cl}: n={sum(x >= 0 for x in a)} "
+              f"nodes={s.solve_stats['nodes']} time={time.time()-t0:.3f}s")
 
 
 if __name__ == "__main__":

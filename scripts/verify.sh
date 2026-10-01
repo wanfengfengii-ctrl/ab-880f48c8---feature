@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # One-shot verification run inside the "verify" Compose service.
-# Aggregates: unit tests, application build/import check and a collision-aware
-# API smoke test.  Exits non-zero if any stage fails.
+# Aggregates: unit tests, application build/import check and an API smoke
+# test covering collision constraints and dual-fibre group trade-offs
+# (whole-group allocation / whole-group drop with atomicity shortfall).
+# Exits non-zero if any stage fails.
 set -u
 
 cd "$(dirname "$0")/.."

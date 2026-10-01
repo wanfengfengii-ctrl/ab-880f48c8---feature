@@ -85,16 +85,63 @@ echo $?   # 0 表示全部通过
 * `arm_lengths`：各臂实际伸长；
 * `clearance.pair_evidence`：**逐对最小净距证据**（精确值 `distance_exact`、
   平方精确值、浮点值、要求净距、是否满足、最近点见证坐标）；
-* `objective`：分配数、优先级和、伸长平方和与优化顺序说明。
+* `objective`：分配数、优先级和、伸长平方和与优化顺序说明；
+* `fibre_groups`：提交了双纤观测组时，**逐组**给出完整分配状态。
 
 当达不到 `minimum_allocations` 时，接口仍返回 `200`，但
 `status = "minimum_not_met"`、`feasible = false`，并给出：
 
 * `objective.num_allocations`：**实际可达的最大分配数量**；
-* `reason`：明确的自然语言原因（净距冲突 / 不可达 / 容量不足）；
+* `reason`：明确的自然语言原因（净距冲突 / 不可达 / 容量不足 /
+  双纤原子约束造成的短缺及被禁分配数）；
 * `witness.blocking_pair`：一对各自可达但互相违反净距的分配及其精确距离、
   最近点见证（若导致短缺的结构性冲突存在）；
+* `witness.dual_fibre`：当短缺与双纤原子约束有关时，对比"无原子约束最大数
+  `maximum_without_atomicity`"与"原子约束下最大数
+  `maximum_with_atomicity`"，给出 `allocations_blocked_by_atomicity`
+  及在无约束最优解中会被拆散的组 `would_be_split_groups`；
 * 返回的部分分配本身仍然满足全部碰撞约束并附完整逐对证据。
+
+## 双纤观测组（可选）
+
+值班员可在同一请求中选填 **1–6 个** `fibre_groups`，每个组引用**两个不同
+目标**，且目标不得跨组复用（违反一律 `422`）：
+
+```json
+{
+  "fibre_groups": [
+    {"id": "G0", "target_a": "T0", "target_b": "T1"}
+  ]
+}
+```
+
+* 组内两个目标构成**原子约束**：要么由**两根不同光纤臂同时分配**（每目标
+  一根臂），要么**整体都不分配**；不存在"只分到一个"的结果；
+* 未入组目标仍可单独分配，整组与单目标在同一轮联合优化中一起抉择；
+* 求解器在分支定界中同时对碰撞冲突和"组被拆散"分支，因此得到的是**联合
+  全局最优**，而不是先求旧最优解再删除残组（那会平白损失分配数）；
+* 不提交 `fibre_groups` 时，请求、响应字段（`fibre_groups` 为 `null`）与
+  裁决结果与旧版完全兼容。
+
+提交组时，响应的 `fibre_groups` 数组按提交顺序逐组给出：
+
+```json
+{
+  "group_id": "G0",
+  "status": "allocated",
+  "members": [
+    {"group_id": "G0", "slot": "a", "target_id": "T0",
+     "allocated": true, "arm_id": "A0",
+     "extension": 14.14, "extension_sq": 200},
+    {"group_id": "G0", "slot": "b", "target_id": "T1",
+     "allocated": true, "arm_id": "A1",
+     "extension": 14.14, "extension_sq": 200}
+  ]
+}
+```
+
+整组未分配时 `status = "unallocated"`，两个成员的 `allocated` 均为
+`false`、`arm_id` 为 `null`。
 
 ## 本地开发
 
@@ -111,5 +158,9 @@ uvicorn app.main:app --port 8080
   并校验见证点恰在两线段上、净距边界精确成立；
 * `tests/test_solver.py`：目标四层级（数量→优先级→伸长²→稳定序列）、
   交叉/汇聚碰撞、不可达、容量上限等；
+* `tests/test_fibre_groups.py`：双纤组整组分配/整组放弃、碰撞弃组、
+  联合优化（非旧解裁剪）、原子性短缺证据，并含带组暴力对拍校验；
 * `scripts/fuzz_compare.py`：数百个小实例与**全枚举暴力最优解**逐一对比；
-* `tests/test_api.py`：严格输入校验、可行/短缺/证据、最大规模实例。
+* `tests/test_api.py`：严格输入校验、可行/短缺/证据、最大规模实例，
+  以及双纤组的 422 校验、逐组响应与原子性短缺；
+* `scripts/smoke_api.py`：verify 冒烟额外覆盖整组取舍与碰撞/原子短缺。

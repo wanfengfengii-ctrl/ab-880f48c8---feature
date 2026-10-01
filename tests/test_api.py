@@ -151,3 +151,157 @@ def test_maximum_size_instance_accepted(client):
     assert body["objective"]["num_allocations"] >= 1
     for p in body["clearance"]["pair_evidence"]:
         assert p["distance"] + 1e-9 >= p["required_clearance"]
+
+
+# ---------------------------------------------------------------------------
+# Dual-fibre observation groups
+# ---------------------------------------------------------------------------
+def group_payload(**overrides):
+    # A0/A1 cover the grouped pair T0/T1; A2..A5 cover singles T2..T5.
+    return far_apart_payload(
+        fibre_groups=[{"id": "G0", "target_a": "T0", "target_b": "T1"}])
+
+
+def test_request_without_groups_is_unchanged(client):
+    body = far_apart_payload()
+    assert "fibre_groups" not in body
+    r = client.post("/api/v1/adjudicate", json=body)
+    assert r.status_code == 200
+    assert r.json()["fibre_groups"] is None
+    assert r.json()["limits"]["fibre_groups_submitted"] == 0
+
+
+def test_group_allocated_with_arms_per_target(client):
+    r = client.post("/api/v1/adjudicate", json=group_payload())
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["status"] == "ok"
+    assert body["limits"]["fibre_groups_submitted"] == 1
+    groups = body["fibre_groups"]
+    assert len(groups) == 1
+    g = groups[0]
+    assert g["group_id"] == "G0" and g["status"] == "allocated"
+    by_target = {m["target_id"]: m for m in g["members"]}
+    assert set(by_target) == {"T0", "T1"}
+    assert by_target["T0"]["allocated"] and by_target["T1"]["allocated"]
+    assert by_target["T0"]["arm_id"] == "A0"
+    assert by_target["T1"]["arm_id"] == "A1"
+    assert by_target["T0"]["arm_id"] != by_target["T1"]["arm_id"]
+    for m in g["members"]:
+        assert m["extension"] > 0 and m["extension_sq"] > 0
+
+
+def test_group_jointly_kept_not_trimmed_from_old_optimum(client):
+    # Ungrouped optimum takes T0 (A0), s1 (A1), s2 (A2): group G1=(t0,t1)
+    # would be split, and trimming leaves 2.  The joint optimum keeps the
+    # whole group and still allocates 3.
+    payload = {
+        "arms": [
+            {"id": "A0", "x": 0, "y": 0, "max_extension": 10},
+            {"id": "A1", "x": 100, "y": 0, "max_extension": 100},
+            {"id": "A2", "x": 300, "y": 0, "max_extension": 10},
+            {"id": "A3", "x": 1000, "y": 0, "max_extension": 500},
+            {"id": "A4", "x": 2000, "y": 0, "max_extension": 500},
+            {"id": "A5", "x": 3000, "y": 0, "max_extension": 500},
+        ],
+        "targets": [
+            {"id": "t0", "x": 5, "y": 0, "priority": 9},
+            {"id": "t1", "x": 95, "y": 0, "priority": 1},
+            {"id": "s1", "x": 105, "y": 0, "priority": 8},
+            {"id": "s2", "x": 305, "y": 0, "priority": 8},
+            {"id": "s3", "x": 1005, "y": 0, "priority": 8},
+            {"id": "s4", "x": 2005, "y": 0, "priority": 8},
+        ],
+        "clearance": 1,
+        "minimum_allocations": 3,
+        "fibre_groups": [{"id": "G1", "target_a": "t0", "target_b": "t1"}],
+    }
+    r = client.post("/api/v1/adjudicate", json=payload)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["status"] == "ok", body["reason"]
+    pairs = {p["target_id"]: p["arm_id"] for p in body["assignments"]}
+    assert pairs["t0"] == "A0" and pairs["t1"] == "A1" and pairs["s2"] == "A2"
+    # the whole group plus the three far singles
+    assert body["objective"]["num_allocations"] == 5
+    g = body["fibre_groups"][0]
+    assert g["status"] == "allocated"
+
+
+def test_group_reported_whole_unallocated_with_atomicity_shortfall(client):
+    # G1 members are both only reachable by A0: the pair is impossible, so
+    # the group is wholly unallocated and the atomic shortfall is explained.
+    payload = {
+        "arms": [
+            {"id": "A0", "x": 0, "y": 0, "max_extension": 100},
+            {"id": "A1", "x": 300, "y": 0, "max_extension": 10},
+            {"id": "A2", "x": 400, "y": 0, "max_extension": 10},
+            {"id": "A3", "x": 1000, "y": 0, "max_extension": 500},
+            {"id": "A4", "x": 2000, "y": 0, "max_extension": 500},
+            {"id": "A5", "x": 3000, "y": 0, "max_extension": 500},
+        ],
+        "targets": [
+            {"id": "t0", "x": 5, "y": 0, "priority": 9},
+            {"id": "t1", "x": 10, "y": 0, "priority": 9},
+            {"id": "s1", "x": 305, "y": 0, "priority": 1},
+            {"id": "s2", "x": 405, "y": 0, "priority": 1},
+            {"id": "s3", "x": 1005, "y": 0, "priority": 1},
+            {"id": "s4", "x": 2005, "y": 0, "priority": 1},
+        ],
+        "clearance": 1,
+        "minimum_allocations": 5,
+        "fibre_groups": [{"id": "G1", "target_a": "t0", "target_b": "t1"}],
+    }
+    r = client.post("/api/v1/adjudicate", json=payload)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "minimum_not_met"
+    # four unrelated singles remain achievable; the global maximum is 4
+    assert body["objective"]["num_allocations"] == 4
+    g = body["fibre_groups"][0]
+    assert g["status"] == "unallocated"
+    assert all(not m["allocated"] and m["arm_id"] is None
+               for m in g["members"])
+    df = body["witness"]["dual_fibre"]
+    assert df["constraint"] == "dual_fibre_atomic"
+    assert df["maximum_without_atomicity"] == 5
+    assert df["maximum_with_atomicity"] == 4
+    assert df["allocations_blocked_by_atomicity"] == 1
+    assert df["would_be_split_groups"][0]["group_id"] == "G1"
+    assert "atomic" in body["reason"]
+
+
+def test_invalid_group_payloads_rejected(client):
+    def post(patch):
+        payload = group_payload()
+        payload.update(patch)
+        return client.post("/api/v1/adjudicate", json=payload)
+
+    # two distinct targets required
+    g = [{"id": "G0", "target_a": "T0", "target_b": "T0"}]
+    assert post({"fibre_groups": g}).status_code == 422
+    # unknown target reference
+    g = [{"id": "G0", "target_a": "T0", "target_b": "NOPE"}]
+    assert post({"fibre_groups": g}).status_code == 422
+    # target reused across groups
+    g = [
+        {"id": "G0", "target_a": "T0", "target_b": "T1"},
+        {"id": "G1", "target_a": "T0", "target_b": "T2"},
+    ]
+    assert post({"fibre_groups": g}).status_code == 422
+    # duplicate group ids
+    g = [
+        {"id": "G0", "target_a": "T0", "target_b": "T1"},
+        {"id": "G0", "target_a": "T2", "target_b": "T3"},
+    ]
+    assert post({"fibre_groups": g}).status_code == 422
+    # more than six groups
+    g = [{"id": f"G{i}", "target_a": f"T{2*i}", "target_b": f"T{2*i+1}"}
+         for i in range(7)]
+    assert post({"fibre_groups": g}).status_code == 422
+    # empty group list is rejected (field is optional, not a list of zero)
+    assert post({"fibre_groups": []}).status_code == 422
+    # unknown field inside a group
+    g = [{"id": "G0", "target_a": "T0", "target_b": "T1", "x": 1}]
+    assert post({"fibre_groups": g}).status_code == 422
+

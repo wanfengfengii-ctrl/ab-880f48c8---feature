@@ -20,7 +20,7 @@ from fastapi.responses import JSONResponse
 
 from .geometry import segment_distance_sq
 from .schemas import AdjudicateRequest, AdjudicateResponse
-from .solver import Arm, Solver, Target
+from .solver import Arm, FibreGroup, Solver, Target
 
 _ready = False
 
@@ -60,9 +60,12 @@ def adjudicate(req: AdjudicateRequest) -> AdjudicateResponse:
             for a in req.arms]
     targets = [Target(id=t.id, x=t.x, y=t.y, priority=t.priority)
                for t in req.targets]
+    groups = [FibreGroup(id=g.id, target_a=g.target_a, target_b=g.target_b)
+              for g in (req.fibre_groups or [])]
     solver = Solver(arms, targets,
                     clearance=req.clearance,
-                    minimum_allocations=req.minimum_allocations)
+                    minimum_allocations=req.minimum_allocations,
+                    groups=groups)
     assignment, feasible, witness = solver.solve()
     r = solver.build_result(assignment, feasible, witness)
 
@@ -97,8 +100,10 @@ def adjudicate(req: AdjudicateRequest) -> AdjudicateResponse:
             "reachable_arm_target_links": r.reachable_count,
             "arms_submitted": len(arms),
             "targets_submitted": len(targets),
+            "fibre_groups_submitted": len(groups),
         },
         witness=r.witness,
+        fibre_groups=r.fibre_groups,
     )
 
 

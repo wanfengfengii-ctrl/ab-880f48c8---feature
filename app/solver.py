@@ -16,23 +16,39 @@ Hard constraints:
 * an arm connects to at most one reachable target (distance <= reach);
 * a target is used at most once;
 * the closed segment of every pair of allocations keeps at least ``clearance``
-  distance from every other allocation segment.
+  distance from every other allocation segment;
+* optional *dual-fibre groups*: the two targets of a submitted group are
+  atomic -- either both are allocated (to two distinct arms, one per arm) or
+  neither is.  Targets never belong to more than one group, and ungrouped
+  targets can still be allocated individually.
 
 Algorithm
 ---------
 The whole lexicographic objective is encoded as one *integer* edge weight
 (with dominance constants derived from the instance bounds), so a single
 maximum-weight bipartite matching (Hungarian method) solves the relaxed
-problem where pairwise collisions are ignored.  Branch-and-bound then only
-branches on collisions: if the relaxed matching contains a conflicting pair
-of allocations, every feasible solution omits at least one of the two edges,
-so we recurse with one edge forbidden at a time.  The relaxed matching value
-is an upper bound used for pruning.  All geometry stays exact (Fraction).
+problem where pairwise collisions and group atomicity are ignored.
+Branch-and-bound then branches on every violated constraint of the relaxed
+matching:
+
+* a conflicting pair of allocations is split by requiring / forbidding one
+  of the two edges;
+* a split group (exactly one member matched) is split into "group out"
+  (forbid every edge into either target) or one "group in via edge f"
+  branch per edge that could allocate the missing member (edge required).
+
+A node carries a forbidden-edge set *and* a required-edge set; the relaxed
+matching fixes the required edges (collisions between them make the node
+infeasible) and runs the Hungarian method on the residual bipartite graph.
+Its value is an upper bound used for pruning.  Groups are therefore handled
+jointly with single-target allocations -- the grouped optimum is never
+derived by trimming an unconstrained optimum.  All geometry stays exact
+(Fraction).
 """
 
 from dataclasses import dataclass
 from fractions import Fraction
-from typing import Dict, FrozenSet, List, Optional, Sequence, Tuple
+from typing import Dict, FrozenSet, List, Optional, Sequence, Set, Tuple
 
 from .geometry import segment_distance_sq
 
@@ -57,6 +73,14 @@ class Arm:
     max_extension: int
 
 
+@dataclass(frozen=True)
+class FibreGroup:
+    """A dual-fibre observation group: its two targets are atomic."""
+    id: str
+    target_a: TargetId
+    target_b: TargetId
+
+
 @dataclass
 class SolveResult:
     assignments: List[dict]
@@ -73,6 +97,7 @@ class SolveResult:
     feasible: bool
     reason: Optional[str] = None
     witness: Optional[dict] = None
+    fibre_groups: Optional[List[dict]] = None
 
 
 INF = 10**100
@@ -85,11 +110,13 @@ class Solver:
         targets: Sequence[Target],
         clearance: int,
         minimum_allocations: int,
+        groups: Sequence[FibreGroup] = (),
     ) -> None:
         self.arms = list(arms)
         self.targets = list(targets)
         self.clearance = clearance
         self.minimum_allocations = minimum_allocations
+        self.minimum_requested = minimum_allocations
         self.n_arms = len(self.arms)
         self.n_targets = len(self.targets)
         self.clearance_sq = Fraction(clearance * clearance)
@@ -106,6 +133,21 @@ class Solver:
                     self.len2[i][j] = d2
                     self.edges.append((i, j))
         self.total_reachable = len(self.edges)
+
+        # Dual-fibre groups kept in submission order.
+        self.groups = list(groups)
+        self.target_index: Dict[TargetId, int] = {
+            t.id: j for j, t in enumerate(self.targets)
+        }
+        # group_of_target[j] is the group index owning target j, if any.
+        self.group_of_target: List[Optional[int]] = [None] * self.n_targets
+        self.group_targets: List[Tuple[int, int]] = []
+        for gi, grp in enumerate(self.groups):
+            ja, jb = (self.target_index[grp.target_a],
+                      self.target_index[grp.target_b])
+            self.group_of_target[ja] = gi
+            self.group_of_target[jb] = gi
+            self.group_targets.append((ja, jb))
 
         self._pair_cache: Dict[Tuple[int, int, int, int],
                                Tuple[bool, Fraction, dict]] = {}
@@ -204,98 +246,231 @@ class Solver:
         return min(degrees, key=lambda e: (-degrees[e], e))
 
     # ------------------------------------------------------------------
-    # Relaxed maximum-weight matching with a forbidden-edge set
+    # Relaxed maximum-weight matching with forbidden / required edges
     # ------------------------------------------------------------------
-    def _relaxed_match(self, forbidden: FrozenSet[Edge]
-                       ) -> Tuple[int, List[Edge]]:
+    def _relaxed_match(
+        self,
+        forbidden: FrozenSet[Edge],
+        required: FrozenSet[Edge],
+    ) -> Optional[Tuple[int, List[Edge]]]:
+        """Maximum-weight matching subject to edge availability.
+
+        ``required`` edges are fixed into the matching; the result is
+        ``None`` when they are unreachable, forbidden, share an arm/target
+        or mutually violate clearance -- such a branch is infeasible.  The
+        residual bipartite graph is solved by the Hungarian method.
+        """
         n, m = self.n_arms, self.n_targets
-        size = max(n, m, 1)
-        cost = [[0] * size for _ in range(size)]
-        for (i, j), w in self.weight.items():
-            if (i, j) not in forbidden:
-                cost[i][j] = -w  # Hungarian minimises
-        row_owner, _ = _hungarian(cost)
-        chosen: List[Edge] = []
-        total = 0
-        for i in range(n):
-            j = row_owner[i]
-            if 0 <= j < m and self.len2[i][j] is not None and (i, j) not in forbidden:
-                chosen.append((i, j))
-                total += self.weight[(i, j)]
+        used_rows: Set[int] = set()
+        used_cols: Set[int] = set()
+        fixed: List[Edge] = []
+        fixed_value = 0
+        for edge in sorted(required):
+            i, j = edge
+            if (edge in forbidden or self.len2[i][j] is None
+                    or i in used_rows or j in used_cols):
+                return None
+            used_rows.add(i)
+            used_cols.add(j)
+            fixed.append(edge)
+            fixed_value += self.weight[edge]
+        for idx in range(len(fixed)):
+            for jdx in range(idx + 1, len(fixed)):
+                (i, j), (k, h) = fixed[idx], fixed[jdx]
+                a, b = (i, k) if i < k else (k, i)
+                t1, t2 = (j, h) if i < k else (h, j)
+                if self.pair_info(a, t1, b, t2)[0]:
+                    return None
+
+        free_rows = [i for i in range(n) if i not in used_rows]
+        free_cols = [j for j in range(m) if j not in used_cols]
+        chosen = fixed[:]
+        total = fixed_value
+        if free_rows and free_cols:
+            size = max(len(free_rows), len(free_cols), 1)
+            cost = [[0] * size for _ in range(size)]
+            for ii, i in enumerate(free_rows):
+                for jj, j in enumerate(free_cols):
+                    if (self.len2[i][j] is not None
+                            and (i, j) not in forbidden):
+                        cost[ii][jj] = -self.weight[(i, j)]  # Hungarian min
+            row_owner, _ = _hungarian(cost)
+            for ii, i in enumerate(free_rows):
+                jj = row_owner[ii]
+                if 0 <= jj < len(free_cols):
+                    j = free_cols[jj]
+                    if (self.len2[i][j] is not None
+                            and (i, j) not in forbidden):
+                        chosen.append((i, j))
+                        total += self.weight[(i, j)]
         return total, chosen
 
     # ------------------------------------------------------------------
-    # Branch and bound on collision pairs
+    # Dual-fibre group helpers
+    # ------------------------------------------------------------------
+    def _split_group(self, chosen: List[Edge]
+                     ) -> Optional[Tuple[int, int]]:
+        """A group split by the relaxed matching: ``(group index, index of
+        the member target left unmatched)``; ``None`` when every group is
+        either fully in or fully out."""
+        matched: Dict[int, int] = {}
+        for i, j in chosen:
+            matched[j] = i
+        for gi, (ja, jb) in enumerate(self.group_targets):
+            in_a, in_b = ja in matched, jb in matched
+            if in_a != in_b:
+                return gi, jb if in_a else ja
+        return None
+
+    def _conflicts(self, edge: Edge, others: Sequence[Edge]) -> bool:
+        ei, ej = edge
+        for k, h in others:
+            if k == ei:
+                continue
+            a, b = (ei, k) if ei < k else (k, ei)
+            t1, t2 = (ej, h) if ei < k else (h, ej)
+            if self.pair_info(a, t1, b, t2)[0]:
+                return True
+        return False
+
+    # ------------------------------------------------------------------
+    # Branch and bound on collisions *and* group atomicity
     # ------------------------------------------------------------------
     def solve(self) -> Tuple[Tuple[int, ...], bool, Optional[dict]]:
         # Feasible incumbent from deterministic greedy seeds (enables pruning
-        # at the root); then exact collision branching proves optimality.
+        # at the root); then exact branching proves joint optimality over
+        # whole groups and single targets.
         incumbent = self._greedy_seed()
         best_value = self.matching_weight(incumbent)
         best_assignment = incumbent[:]
         stats = {"nodes": 0}
-        memo: Dict[FrozenSet[Edge], Tuple[int, List[Edge]]] = {}
+        memo: Dict[Tuple[FrozenSet[Edge], FrozenSet[Edge]],
+                  Optional[Tuple[int, List[Edge]]]] = {}
 
-        def recurse(forbidden: FrozenSet[Edge]) -> None:
+        def recurse(forbidden: FrozenSet[Edge],
+                    required: FrozenSet[Edge]) -> None:
             nonlocal best_value, best_assignment
             stats["nodes"] += 1
-            cached = memo.get(forbidden)
+            key = (forbidden, required)
+            cached = memo.get(key)
             if cached is not None:
-                bound, chosen = cached
+                relaxed = cached
             else:
-                bound, chosen = self._relaxed_match(forbidden)
-                memo[forbidden] = (bound, chosen)
+                relaxed = self._relaxed_match(forbidden, required)
+                memo[key] = relaxed
+            if relaxed is None:
+                return  # infeasible node
+            bound, chosen = relaxed
             if bound <= best_value:
                 return  # cannot improve the incumbent
-            if self._first_conflict(chosen) is None:
-                # Relaxed optimum is collision-free -> true optimum of node.
-                assignment = [-1] * self.n_arms
-                for i, j in chosen:
-                    assignment[i] = j
-                best_value = bound
-                best_assignment = assignment
+
+            conflict = self._first_conflict(chosen)
+            if conflict is None:
+                split = self._split_group(chosen)
+                if split is None:
+                    # Relaxed optimum satisfies every hard constraint.
+                    assignment = [-1] * self.n_arms
+                    for i, j in chosen:
+                        assignment[i] = j
+                    best_value = bound
+                    best_assignment = assignment
+                    return
+            else:
+                split = None
+
+            if conflict is not None:
+                edge = self._branch_edge(chosen)
+                ei, ej = edge
+                # Branch 1: include ``edge`` -> require it, forbid every
+                # other edge on its arm/target and every edge that collides
+                # with it.  Infeasible if that contradicts an already
+                # required edge.
+                forced: set = set(forbidden)
+                new_required: set = set(required)
+                feasible_include = True
+                for jj in range(self.n_targets):
+                    if jj != ej and self.len2[ei][jj] is not None:
+                        if (ei, jj) in required:
+                            feasible_include = False
+                        forced.add((ei, jj))
+                for ii in range(self.n_arms):
+                    if ii != ei and self.len2[ii][ej] is not None:
+                        if (ii, ej) in required:
+                            feasible_include = False
+                        forced.add((ii, ej))
+                for (k, h) in self.edges:
+                    if k == ei:
+                        continue
+                    a, b = (ei, k) if ei < k else (k, ei)
+                    t1, t2 = (ej, h) if ei < k else (h, ej)
+                    if self.pair_info(a, t1, b, t2)[0]:
+                        if (k, h) in required:
+                            feasible_include = False
+                        forced.add((k, h))
+                if feasible_include:
+                    new_required.add(edge)
+                    recurse(frozenset(forced), frozenset(new_required))
+                    if best_value == bound:
+                        return  # reached the node's upper bound
+                # Branch 2: exclude ``edge``.
+                recurse(forbidden | {edge}, required)
                 return
 
-            edge = self._branch_edge(chosen)
-            ei, ej = edge
-            # Branch 1: include ``edge`` -> forbid every other edge on its
-            # arm or target, and every edge in the whole graph that collides
-            # with it.
-            forced: set = set(forbidden)
-            for jj in range(self.n_targets):
-                if jj != ej and self.len2[ei][jj] is not None:
-                    forced.add((ei, jj))
-            for ii in range(self.n_arms):
-                if ii != ei and self.len2[ii][ej] is not None:
-                    forced.add((ii, ej))
-            for (k, h) in self.edges:
-                if k == ei:
-                    continue
-                a, b = (ei, k) if ei < k else (k, ei)
-                t1, t2 = (ej, h) if ei < k else (h, ej)
-                if self.pair_info(a, t1, b, t2)[0]:
-                    forced.add((k, h))
-            recurse(frozenset(forced))
-            if best_value == bound:
-                return  # reached the node's upper bound
-            # Branch 2: exclude ``edge``.
-            recurse(forbidden | {edge})
+            # Group atomicity split: one member is matched, the other not.
+            gi, missing = split  # type: ignore[misc]
+            ja, jb = self.group_targets[gi]
 
-        recurse(frozenset())
+            # Branch family A: the group is fully IN; the missing member is
+            # allocated via one specific edge (arm -> missing target).
+            busy_rows = {i for (i, _) in required}
+            for i in range(self.n_arms):
+                f = (i, missing)
+                if (i in busy_rows or f in forbidden
+                        or self.len2[i][missing] is None):
+                    continue
+                if self._conflicts(f, list(required)):
+                    continue
+                recurse(forbidden, required | {f})
+                if best_value == bound:
+                    return
+
+            # Branch B: the group is fully OUT -> forbid every edge entering
+            # either member target.  Infeasible if a required edge does so.
+            out_forced = set(forbidden)
+            feasible_out = True
+            for j in (ja, jb):
+                for ii in range(self.n_arms):
+                    if self.len2[ii][j] is not None:
+                        if (ii, j) in required:
+                            feasible_out = False
+                        out_forced.add((ii, j))
+            if feasible_out:
+                recurse(frozenset(out_forced), required)
+
+        recurse(frozenset(), frozenset())
         self.solve_stats = stats
 
         best_tuple = tuple(best_assignment)
         count = sum(1 for x in best_tuple if x >= 0)
         witness = None
+        self.atomic_summary = None
         if count < self.minimum_allocations:
             witness = self._shortfall_witness()
+            if self.groups:
+                self.atomic_summary = self._atomicity_summary(best_tuple)
+                witness["dual_fibre"] = self.atomic_summary
         return best_tuple, count >= self.minimum_allocations, witness
 
     # ------------------------------------------------------------------
     # Greedy feasible seeds
     # ------------------------------------------------------------------
     def _greedy_seed(self) -> List[int]:
-        """Best of several deterministic greedy, always-feasible passes."""
+        """Best of several deterministic greedy, always-feasible passes.
+
+        Every returned seed honours group atomicity: the plain passes are
+        repaired by dropping the lone allocation of any split group, and an
+        additional pass places whole groups first.
+        """
         n, m = self.n_arms, self.n_targets
         candidates: List[List[int]] = []
 
@@ -321,15 +496,100 @@ class Solver:
                         break
             return assignment
 
-        candidates.append(greedy(range(n), lambda i, j: j))
+        def group_feasible(assignment: List[int]) -> bool:
+            for ja, jb in self.group_targets:
+                am = _arm_of(assignment, ja) >= 0
+                bm = _arm_of(assignment, jb) >= 0
+                if am != bm:
+                    return False
+            return True
+
+        def repair(assignment: List[int]) -> List[int]:
+            # Drop the lone matched member of every split group; iterate to
+            # a fixed point (dropping never splits another group).
+            assignment = assignment[:]
+            for ja, jb in self.group_targets:
+                ia, ib = _arm_of(assignment, ja), _arm_of(assignment, jb)
+                if (ia >= 0) != (ib >= 0):
+                    i = ia if ia >= 0 else ib
+                    assignment[i] = -1
+            return assignment
+
+        candidates.append(repair(greedy(range(n), lambda i, j: j)))
         # Process the most constrained arms first.
         constrained = sorted(
             range(n),
             key=lambda i: (sum(1 for d2 in self.len2[i] if d2 is not None), i))
-        candidates.append(greedy(constrained,
-                                 lambda i, j: -self.targets[j].priority))
-        candidates.append(greedy(constrained, lambda i, j: self.len2[i][j]))
+        candidates.append(repair(greedy(
+            constrained, lambda i, j: -self.targets[j].priority)))
+        candidates.append(repair(greedy(
+            constrained, lambda i, j: self.len2[i][j])))
+        if self.groups:
+            candidates.append(repair(self._group_first_seed()))
+        # Keep only genuinely feasible seeds.
+        candidates = [c for c in candidates if group_feasible(c)]
         return max(candidates, key=self.matching_weight)
+
+    def _group_first_seed(self) -> List[int]:
+        """Greedy pass that allocates whole dual-fibre groups before any
+        ungrouped target."""
+        n = self.n_arms
+        assignment = [-1] * n
+        used = [False] * self.n_targets
+        placed: List[Edge] = []
+
+        def compatible(edge: Edge) -> bool:
+            i, j = edge
+            for k, h in placed:
+                a, b = (i, k) if i < k else (k, i)
+                t1, t2 = (j, h) if i < k else (h, j)
+                if self.pair_info(a, t1, b, t2)[0]:
+                    return False
+            return True
+
+        def place(edge: Edge) -> None:
+            i, j = edge
+            assignment[i] = j
+            used[j] = True
+            placed.append(edge)
+
+        for ja, jb in self.group_targets:
+            best_pair = None
+            best_gain = None
+            for i in range(n):
+                if assignment[i] >= 0 or self.len2[i][ja] is None:
+                    continue
+                for k in range(n):
+                    if k == i or assignment[k] >= 0 \
+                            or self.len2[k][jb] is None:
+                        continue
+                    e1, e2 = (i, ja), (k, jb)
+                    a, b = (i, k) if i < k else (k, i)
+                    t1, t2 = (ja, jb) if i < k else (jb, ja)
+                    if self.pair_info(a, t1, b, t2)[0]:
+                        continue
+                    if not compatible(e1) or not compatible(e2):
+                        continue
+                    gain = self.weight[e1] + self.weight[e2]
+                    if best_gain is None or gain > best_gain:
+                        best_gain, best_pair = gain, (e1, e2)
+            if best_pair is not None:
+                place(best_pair[0])
+                place(best_pair[1])
+
+        # Ungrouped targets fill any remaining arms, lowest index first.
+        for i in range(n):
+            if assignment[i] >= 0:
+                continue
+            for j in range(self.n_targets):
+                if used[j] or self.len2[i][j] is None:
+                    continue
+                if self.group_of_target[j] is not None:
+                    continue  # grouped targets are only taken as a pair
+                if compatible((i, j)):
+                    place((i, j))
+                    break
+        return assignment
 
     # ------------------------------------------------------------------
     # Shortfall explanation
@@ -364,6 +624,54 @@ class Solver:
             "blocking_pair": blocking,
             "capacity_limit": min(self.n_arms, self.n_targets),
             "reachable_arm_target_links": self.total_reachable,
+        }
+
+    def _atomicity_summary(self, assignment: Sequence[int]) -> dict:
+        """Evidence that the shortfall is driven (at least in part) by the
+        dual-fibre atomicity constraint: compare the joint optimum with the
+        optimum that would exist if groups were allowed to split.
+
+        ``ungrouped_maximum`` is obtained with every group disabled; the
+        number of split allocations in that optimum is the count of
+        allocations forbidden by atomicity alone.
+        """
+        # Re-solve the same instance with no groups: the optimum without the
+        # atomicity constraint (still reachability + uniqueness + clearance).
+        relaxed = Solver(self.arms, self.targets, self.clearance,
+                         self.minimum_allocations, groups=())
+        relaxed_assignment, _, _ = relaxed.solve()
+        ungrouped_maximum = sum(1 for x in relaxed_assignment if x >= 0)
+
+        split_groups: List[dict] = []
+        arm_of = {j: i for i, j in enumerate(relaxed_assignment) if j >= 0}
+        for gi, (ja, jb) in enumerate(self.group_targets):
+            grp = self.groups[gi]
+            ia, ib = arm_of.get(ja), arm_of.get(jb)
+            if (ia is not None) != (ib is not None):
+                j = ja if ia is not None else jb
+                i = ia if ia is not None else ib
+                split_groups.append({
+                    "group_id": grp.id,
+                    "allocated_target": self.targets[j].id,
+                    "allocated_arm": self.arms[i].id,
+                    "unallocated_target": (
+                        self.targets[jb].id if j == ja else self.targets[ja].id),
+                })
+
+        actual = sum(1 for x in assignment if x >= 0)
+        atomic_cost = ungrouped_maximum - actual
+        return {
+            "constraint": "dual_fibre_atomic",
+            "groups_submitted": len(self.groups),
+            "maximum_without_atomicity": ungrouped_maximum,
+            "maximum_with_atomicity": actual,
+            "allocations_blocked_by_atomicity": atomic_cost,
+            "would_be_split_groups": split_groups,
+            "note": (
+                "each dual-fibre group must be allocated as an indivisible "
+                "pair (one arm per target) or not at all; allocations that "
+                "would split a group are forbidden"
+            ),
         }
 
     # ------------------------------------------------------------------
@@ -443,6 +751,20 @@ class Solver:
         else:
             reason = None
 
+        fibre_groups = None
+        if self.groups:
+            fibre_groups = self._group_records(assignment)
+            if (not feasible and getattr(self, "atomic_summary", None)
+                    is not None
+                    and self.atomic_summary["allocations_blocked_by_atomicity"] > 0):
+                blocked = self.atomic_summary["allocations_blocked_by_atomicity"]
+                reason = (reason or "") + (
+                    "; the dual-fibre atomic constraint forbids "
+                    f"{blocked} allocation(s) that would otherwise be "
+                    "available (each group's two targets may only be "
+                    "allocated as an indivisible pair)"
+                )
+
         return SolveResult(
             assignments=pairs,
             unassigned_arms=unassigned_arms,
@@ -455,11 +777,51 @@ class Solver:
             priority_sum=prio_sum,
             extension_sq_sum=ext_sq_sum,
             reachable_count=self.total_reachable,
-            minimum_requested=self.minimum_allocations,
+            minimum_requested=self.minimum_requested,
             feasible=feasible,
             reason=reason,
             witness=witness,
+            fibre_groups=fibre_groups,
         )
+
+    # ------------------------------------------------------------------
+    # Per-group allocation records
+    # ------------------------------------------------------------------
+    def _group_records(self, assignment: Sequence[int]) -> List[dict]:
+        """One record per submitted group: fully allocated (with the arm for
+        each target) or wholly unallocated.  A partial record can never occur
+        because the solver enforces atomicity."""
+        records: List[dict] = []
+        for gi, (ja, jb) in enumerate(self.group_targets):
+            grp = self.groups[gi]
+            ia, ib = _arm_of(assignment, ja), _arm_of(assignment, jb)
+            status = "allocated" if ia >= 0 and ib >= 0 else "unallocated"
+            records.append({
+                "group_id": grp.id,
+                "status": status,
+                "members": [
+                    self._member_record(grp.id, ia, ja, "a"),
+                    self._member_record(grp.id, ib, jb, "b"),
+                ],
+            })
+        return records
+
+    def _member_record(self, group_id: str, arm_i: int, target_j: int,
+                       slot: str) -> dict:
+        record = {
+            "group_id": group_id,
+            "slot": slot,
+            "target_id": self.targets[target_j].id,
+            "allocated": arm_i >= 0,
+            "arm_id": self.arms[arm_i].id if arm_i >= 0 else None,
+            "extension": None,
+            "extension_sq": None,
+        }
+        if arm_i >= 0:
+            d2 = self.len2[arm_i][target_j] or 0
+            record["extension"] = float(d2 ** 0.5)
+            record["extension_sq"] = d2
+        return record
 
 
 # ----------------------------------------------------------------------
@@ -549,3 +911,12 @@ def _isqrt(n: int) -> int:
         x = y
         y = (x + n // x) // 2
     return x
+
+
+def _arm_of(assignment: Sequence[int], target: int) -> int:
+    """Index of the arm allocated to ``target`` in an assignment array, or
+    -1 when the target is unused."""
+    for i, j in enumerate(assignment):
+        if j == target:
+            return i
+    return -1

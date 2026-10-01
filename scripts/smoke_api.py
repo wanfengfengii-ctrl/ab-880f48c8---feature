@@ -8,7 +8,11 @@ It waits for readiness and exercises:
 2. an instance where pairwise collisions make the requested minimum
    impossible: the API must return the maximum achievable count and a clear
    reason (HTTP 200, status minimum_not_met);
-3. an illegal payload that must be rejected with HTTP 422 without solving.
+3. an illegal payload that must be rejected with HTTP 422 without solving;
+4. dual-fibre observation groups: a group allocated as one indivisible pair
+   with one arm per member, a group the joint optimum must keep whole rather
+   than trimming an ungrouped optimum, and an impossible group whose
+   atomicity causes a reported shortfall.
 
 Exits 0 on success, 1 on any failure.
 """
@@ -80,6 +84,61 @@ def collision_payload():
             "clearance": 3, "minimum_allocations": 6}
 
 
+def group_kept_payload():
+    # Ungrouped optimum splits group G1=(t0,t1): A0->t0, A1->s1, ... and
+    # naive trimming loses count.  The joint optimum keeps the whole group
+    # (A0->t0, A1->t1) and the far singles; the group must read "allocated".
+    return {
+        "arms": [
+            {"id": "A0", "x": 0, "y": 0, "max_extension": 10},
+            {"id": "A1", "x": 100, "y": 0, "max_extension": 100},
+            {"id": "A2", "x": 300, "y": 0, "max_extension": 10},
+            {"id": "A3", "x": 1000, "y": 0, "max_extension": 500},
+            {"id": "A4", "x": 2000, "y": 0, "max_extension": 500},
+            {"id": "A5", "x": 3000, "y": 0, "max_extension": 500},
+        ],
+        "targets": [
+            {"id": "t0", "x": 5, "y": 0, "priority": 9},
+            {"id": "t1", "x": 95, "y": 0, "priority": 1},
+            {"id": "s1", "x": 105, "y": 0, "priority": 8},
+            {"id": "s2", "x": 305, "y": 0, "priority": 8},
+            {"id": "s3", "x": 1005, "y": 0, "priority": 8},
+            {"id": "s4", "x": 2005, "y": 0, "priority": 8},
+        ],
+        "clearance": 1,
+        "minimum_allocations": 5,
+        "fibre_groups": [{"id": "G1", "target_a": "t0", "target_b": "t1"}],
+    }
+
+
+def group_unallocatable_payload():
+    # Both G1 members are only reachable by A0, so the pair cannot be
+    # allocated: the group is wholly unallocated and atomicity reduces the
+    # maximum from 5 (one member + four singles) to 4.
+    return {
+        "arms": [
+            {"id": "A0", "x": 0, "y": 0, "max_extension": 100},
+            {"id": "A1", "x": 300, "y": 0, "max_extension": 10},
+            {"id": "A2", "x": 400, "y": 0, "max_extension": 10},
+            {"id": "A3", "x": 1000, "y": 0, "max_extension": 500},
+            {"id": "A4", "x": 2000, "y": 0, "max_extension": 500},
+            {"id": "A5", "x": 3000, "y": 0, "max_extension": 500},
+        ],
+        "targets": [
+            {"id": "t0", "x": 5, "y": 0, "priority": 9},
+            {"id": "t1", "x": 10, "y": 0, "priority": 9},
+            {"id": "s1", "x": 305, "y": 0, "priority": 1},
+            {"id": "s2", "x": 405, "y": 0, "priority": 1},
+            {"id": "s3", "x": 1005, "y": 0, "priority": 1},
+            {"id": "s4", "x": 2005, "y": 0, "priority": 1},
+        ],
+        "clearance": 1,
+        "minimum_allocations": 5,
+        "fibre_groups": [{"id": "G1", "target_a": "t0", "target_b": "t1"}],
+    }
+
+
+
 def main():
     wait_ready()
     print("readiness OK")
@@ -134,6 +193,59 @@ def main():
     bad["arms"] = bad["arms"][:5]
     request("POST", "/api/v1/adjudicate", bad, expect=(422,))
     print("illegal input rejected with 422")
+
+    # 4a) dual-fibre group kept whole by the joint optimization
+    _, body = request("POST", "/api/v1/adjudicate", group_kept_payload())
+    assert body["status"] == "ok", body
+    assert body["limits"]["fibre_groups_submitted"] == 1
+    g = body["fibre_groups"][0]
+    assert g["group_id"] == "G1" and g["status"] == "allocated", g
+    by_target = {m["target_id"]: m for m in g["members"]}
+    assert by_target["t0"]["arm_id"] == "A0"
+    assert by_target["t1"]["arm_id"] == "A1"
+    assert by_target["t0"]["arm_id"] != by_target["t1"]["arm_id"]
+    pairs = {p["target_id"]: p["arm_id"] for p in body["assignments"]}
+    assert pairs["t0"] == "A0" and pairs["t1"] == "A1"
+    assert body["objective"]["num_allocations"] == 5
+    for rec in body["clearance"]["pair_evidence"]:
+        assert rec["satisfied"] is True
+    print("group kept whole OK: G1 allocated with distinct arms")
+
+    # 4b) impossible pair -> group wholly unallocated + atomicity shortfall
+    _, body = request("POST", "/api/v1/adjudicate",
+                      group_unallocatable_payload())
+    assert body["status"] == "minimum_not_met", body
+    assert body["objective"]["num_allocations"] == 4, body["objective"]
+    g = body["fibre_groups"][0]
+    assert g["status"] == "unallocated", g
+    assert all(not m["allocated"] and m["arm_id"] is None
+               for m in g["members"])
+    df = body["witness"]["dual_fibre"]
+    assert df["constraint"] == "dual_fibre_atomic"
+    assert df["maximum_without_atomicity"] == 5
+    assert df["maximum_with_atomicity"] == 4
+    assert df["allocations_blocked_by_atomicity"] == 1
+    assert df["would_be_split_groups"][0]["group_id"] == "G1"
+    assert "atomic" in body["reason"]
+    for rec in body["clearance"]["pair_evidence"]:
+        assert rec["satisfied"] is True
+    print("group dropped whole OK: max=4 with dual-fibre shortfall evidence")
+
+    # 4c) malformed groups rejected with 422
+    bad = group_kept_payload()
+    bad["fibre_groups"] = [
+        {"id": "G1", "target_a": "t0", "target_b": "t0"}]  # same target
+    request("POST", "/api/v1/adjudicate", bad, expect=(422,))
+    bad = group_kept_payload()
+    bad["fibre_groups"] = [
+        {"id": "G1", "target_a": "t0", "target_b": "missing"}]
+    request("POST", "/api/v1/adjudicate", bad, expect=(422,))
+    bad = group_kept_payload()
+    bad["fibre_groups"] = [
+        {"id": "G1", "target_a": "t0", "target_b": "t1"},
+        {"id": "G2", "target_a": "t0", "target_b": "t2"}]  # t0 reused
+    request("POST", "/api/v1/adjudicate", bad, expect=(422,))
+    print("malformed fibre groups rejected with 422")
 
     print("SMOKE: PASS")
     return 0
